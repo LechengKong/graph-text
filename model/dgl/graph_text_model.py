@@ -56,6 +56,91 @@ class CorrelationFunction(Function):
 
         return grad_H1, grad_H2, grad_reg1, grad_reg2, grad_k
 
+class cca_loss():
+    def __init__(self, outdim_size=20):
+        self.outdim_size = outdim_size
+        # print(device)
+
+    def loss(self, H1, H2):
+        """
+        It is the loss function of CCA as introduced in the original paper. There can be other formulations.
+        """
+
+        r1 = 1e-4
+        r2 = 1e-4
+        eps = 1e-9
+
+        H1, H2 = H1.t(), H2.t()
+        # assert torch.isnan(H1).sum().item() == 0
+        # assert torch.isnan(H2).sum().item() == 0
+
+        o1 = o2 = H1.size(0)
+
+        m = H1.size(1)
+#         print(H1.size())
+
+        H1bar = H1 - H1.mean(dim=1).unsqueeze(dim=1)
+        H2bar = H2 - H2.mean(dim=1).unsqueeze(dim=1)
+        # assert torch.isnan(H1bar).sum().item() == 0
+        # assert torch.isnan(H2bar).sum().item() == 0
+
+        SigmaHat12 = (1.0 / (m - 1)) * torch.matmul(H1bar, H2bar.t())
+        SigmaHat11 = (1.0 / (m - 1)) * torch.matmul(H1bar,
+                                                    H1bar.t()) + r1 * torch.eye(o1, device=H1.device)
+        SigmaHat22 = (1.0 / (m - 1)) * torch.matmul(H2bar,
+                                                    H2bar.t()) + r2 * torch.eye(o2, device=H1.device)
+        # print(SigmaHat11.sum())
+        # print(SigmaHat22.sum())
+        # print(SigmaHat12.sum())
+        assert torch.isnan(SigmaHat11).sum().item() == 0
+        assert torch.isnan(SigmaHat12).sum().item() == 0
+        assert torch.isnan(SigmaHat22).sum().item() == 0
+
+        # Calculating the root inverse of covariance matrices by using eigen decomposition
+        [D1, V1] = torch.linalg.eigh(SigmaHat11)
+        [D2, V2] = torch.linalg.eigh(SigmaHat22)
+        # v,c = torch.unique(D1, return_counts=True)
+        # print(v[c>1])
+        # v,c = torch.unique(D2, return_counts=True)
+        # print(v[c>1])
+        assert torch.isnan(D1).sum().item() == 0
+        assert torch.isnan(D2).sum().item() == 0
+        assert torch.isnan(V1).sum().item() == 0
+        assert torch.isnan(V2).sum().item() == 0
+
+        # Added to increase stability
+        posInd1 = torch.gt(D1, eps).nonzero()[:, 0]
+        D1 = D1[posInd1]
+        V1 = V1[:, posInd1]
+        posInd2 = torch.gt(D2, eps).nonzero()[:, 0]
+        D2 = D2[posInd2]
+        V2 = V2[:, posInd2]
+        # print(posInd1.size())
+        # print(posInd2.size())
+
+        SigmaHat11RootInv = torch.matmul(
+            torch.matmul(V1, torch.diag(D1 ** -0.5)), V1.t())
+        SigmaHat22RootInv = torch.matmul(
+            torch.matmul(V2, torch.diag(D2 ** -0.5)), V2.t())
+
+        Tval = torch.matmul(torch.matmul(SigmaHat11RootInv,
+                                         SigmaHat12), SigmaHat22RootInv)                                
+#         print(Tval.size())
+
+        # just the top self.outdim_size singular values are used
+        trace_TT = torch.matmul(Tval.t(), Tval)
+        trace_TT = torch.add(trace_TT, (torch.eye(trace_TT.shape[0])*r1).to(H1.device)) # regularization for more stability
+        U, V = torch.linalg.eigh(trace_TT)
+        U = torch.where(U>eps, U, (torch.ones(U.shape)*eps).to(H1.device))
+        U = U.topk(self.outdim_size)[0]
+        corr = torch.sum(torch.sqrt(U))
+        U, S, V = torch.svd(Tval)
+        U = U[:,:self.outdim_size]
+        V = V[:,:self.outdim_size]
+        U = torch.matmul(SigmaHat11RootInv, U)
+        V = torch.matmul(SigmaHat22RootInv, V)
+        return corr, U, V
+
 
 class GraphTextModel(torch.nn.Module):
     def __init__(self, vocab_size, embedding_dim, ft_rnn_size, ct_rnn_size, params):
@@ -66,85 +151,100 @@ class GraphTextModel(torch.nn.Module):
         self.param_set_dim = self.params.emb_dim*self.params.num_gcn_layers
         self.embedding_dim = embedding_dim
         self.embeddings = nn.Embedding(vocab_size, embedding_dim)
-        if self.params.cbow_only:
-            self.linear1 = nn.Linear(embedding_dim, 128)
-        else:
-            self.linear1 = nn.Linear(self.param_set_dim, 64)
+        self.linear1 = nn.Linear(self.param_set_dim, 64)
         self.activation_function1 = nn.ReLU()
         
         self.linear2 = nn.Linear(64, self.params.out_dim)
+        self.gnn_fc = FCLayers(2, self.param_set_dim, [128, self.params.out_dim])
         self.gnn_list.append(self.gnn)
-        self.gnn_list.append(self.linear1)
-        self.gnn_list.append(self.linear2)
+        self.gnn_list.append(self.gnn_fc)
 
         self.rnn_list = nn.ModuleList()
 
-        self.ft_rnn = LSTM(self.embedding_dim, self.params.out_dim, batch_first=True)
-        # self.h0 = torch.ones((1, self.params.batch_size,  self.params.out_dim), device=self.params.device)
-        # self.c0 = torch.ones((1, self.params.batch_size,  self.params.out_dim), device=self.params.device)
-        self.corr_eval = CorrelationFunction.apply
+        self.ft_rnn = LSTM(self.embedding_dim, self.params.lstm_dim, batch_first=True)
+        self.ct_rnn = LSTM(self.embedding_dim, self.embedding_dim, batch_first=True)
 
-        self.ft_linear = nn.Linear(self.params.out_dim, self.params.y_dim)
+        self.rnn_fc = FCLayers(2, self.params.lstm_dim, [64, self.params.out_dim])
+        
+        # self.corr_eval = CorrelationFunction.apply
+        self.corr_eval = cca_loss(self.params.corr_dim)
+
         self.rnn_list.append(self.ft_rnn)
-        self.rnn_list.append(self.ft_linear)
+        self.rnn_list.append(self.rnn_fc)
+
+        self.node_emb = nn.Parameter(torch.Tensor(self.params.num_nodes, self.params.inp_dim))
+        nn.init.xavier_uniform_(self.node_emb, gain=nn.init.calculate_gain('relu'))
+        self.batch_project = True
+        self.use_precomputed_emb = False
+        self.U = None
+        self.V = None
+
         
 
-    def forward(self, data):
-        g, context, node_ids, context_len = data
-        self.graph_update(g)
-        return self.fast_forward(data)
+    def forward(self, g, data):
+        if not self.use_precomputed_emb:
+            self.graph_update(g)
+        return self.fast_forward(g, data)
 
-    def fast_forward(self, data):
-        g, context, node_ids, context_len = data
+    def fast_forward(self, g, data):
+        context, node_ids = data
         graph_repr = self.get_graph_embedding(g, node_ids)
-        ft_repr, ft_out = self.mlp_update(context, context_len)
-        # print(graph_repr)
-        # print(torch.var(ft_repr, dim=0).size())
-        # print(torch.sqrt(torch.sum((graph_repr-ft_repr)**2, dim=1)))
-        return -self.corr_eval(graph_repr, ft_repr, self.params.mat_reg_c[0], self.params.mat_reg_c[1]), torch.var(graph_repr, dim=0).mean(), torch.var(ft_repr, dim=0).mean(), ft_out
+        
+        ft_repr = self.text_update(context)
+
+        corr, Ub, Vb = self.corr_eval.loss(graph_repr, ft_repr)
+        closs = -corr
+        if self.batch_project:
+            U = Ub
+            V = Vb
+        else:
+            U = self.U
+            V = self.V
+        # if self.batch_project:
+        #     self.U = Ub
+        #     self.V = Vb
+        # U = self.U
+        # V = self.V
+        graph_repr = torch.matmul(graph_repr, U)
+        ft_repr = torch.matmul(ft_repr, V)
+        # g_var = torch.sqrt(torch.var(graph_repr, dim=0))
+        # f_var = torch.sqrt(torch.var(ft_repr, dim=0))
+        # g_mean = torch.mean(graph_repr, dim=0)
+        # f_mean = torch.mean(ft_repr, dim=0)
+        # cov = torch.sum((graph_repr-g_mean)*(ft_repr-f_mean), dim=0)/(len(graph_repr)-1)
+        # bcorr = cov/(g_var*f_var)
+        # print(bcorr)
+        return closs, torch.var(graph_repr, dim=0).mean(), torch.var(ft_repr, dim=0).mean(), graph_repr, ft_repr
 
     def graph_update(self, g):
         if self.params.use_ct:
-            g.ndata['feat'] = torch.cat([self.embeddings(g.ndata['cont_text']).mean(dim=1),
-                                            g.ndata['node_emb']], dim=1)
+            ct_repr, (_,_) = self.ct_rnn(self.embeddings(g.ndata['cont_text']))
+            g.ndata['feat'] = ct_repr[:,0,:]
         else:
-            g.ndata['feat'] = g.ndata['node_emb']
+            g.ndata['feat'] = self.node_emb
         self.gnn(g)
 
     def get_graph_embedding(self, g, node_ids):
         node_repr = g.ndata['repr'][node_ids]
-        node_repr = self.linear1(node_repr.view(-1, self.param_set_dim))
-        node_repr = self.activation_function1(node_repr)
-        node_repr = self.linear2(node_repr)
+        node_repr = torch.flatten(node_repr, start_dim=2)
+        m_nodes = torch.sign(node_ids+1)
+        node_repr = (node_repr*m_nodes.unsqueeze(2)).sum(dim=1)/m_nodes.sum(dim=1).unsqueeze(1)
+        node_repr = self.gnn_fc(node_repr)
         # return g.ndata['node_emb'][node_ids]
         return node_repr
 
-    def mlp_update(self, context, context_len):
+    def text_update(self, context):
         embeds = self.embeddings(context)
-        ft_repr, (_,_) = self.ft_rnn(embeds)
-        ft_out = self.ft_linear(ft_repr[:,0,:])
-        return ft_repr[:,0,:], ft_out
-
-    def freeze_rnn(self):
-        for layer in self.rnn_list:
-            for p in layer.parameters():
-                p.requires_grad = False
-
-    def unfreeze_rnn(self):
-        for layer in self.rnn_list:
-            for p in layer.parameters():
-                p.requires_grad = True
-
-    def freeze_gnn(self):
-        for layer in self.gnn_list:
-            for p in layer.parameters():
-                p.requires_grad = False
-
-    def unfreeze_gnn(self):
-        for layer in self.gnn_list:
-            for p in layer.parameters():
-                p.requires_grad = True
+        repr, (_,_) = self.ft_rnn(embeds)
+        repr = repr[:,0,:]
+        # mask = context!=self.params.padding_index
+        # repr = torch.sum(embeds*mask.unsqueeze(2), dim=1)
+        return self.rnn_fc(repr)
     
+    def mlp_update(self, context, g, node_ids):
+        # return self.text_update(context)
+        return self.get_graph_embedding(g, node_ids)
+
     def rnn_params(self):
         return [p for p in self.rnn_list.parameters()]
 

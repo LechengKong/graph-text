@@ -1,4 +1,5 @@
 from torch.utils.data import Dataset, DataLoader
+import math
 
 class NodeTextDataset(Dataset):
     def __init__(self, data, graph):
@@ -10,5 +11,5 @@ class NodeTextDataset(Dataset):
         return self.num_sample
 
     def __getitem__(self, index):
-        node_id, context, context_len, code_desc, ct_len, ane_type, los = self.data[index]
-        return node_id, context, context_len, code_desc, ct_len, int(ane_type), los
+        node_id, context, ane_type, los = self.data[index]
+        return node_id, context, int(ane_type), math.log(los+1)

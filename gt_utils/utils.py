@@ -34,18 +34,17 @@ def get_max_text_len(collection, ind):
     return max_len
 
 
-def get_indexed_data(data, max_ft_len, max_ct_len, e2n, w2i, padding_index):
+def get_indexed_data(data, max_prc_len, max_ft_len, max_ct_len, e2n, w2i, padding_index):
     code_text = []
-    for icd, text, icd_pc, ane_type, los in data:
+    for icd, text, ane_type, los in data:
         if len(text) == 0:
             continue
-        clcd = code_cleanup(icd)
-        node_idx = e2n[clcd]
+        nodes = [e2n[code_cleanup(c)] for c in icd]
+        node_indices = np.zeros(max_prc_len, dtype=int)-1
+        node_indices[:len(nodes)] = nodes
         text_indices = np.zeros(max_ft_len, dtype=int)+padding_index
         text_indices[:len(text)] = [w2i[w] for w in text]
-        code_indices = np.zeros(max_ct_len, dtype=int)+padding_index
-        code_indices[:len(icd_pc)] = [w2i[w] for w in icd_pc]
-        code_text.append([node_idx, text_indices, len(text),code_indices, len(icd_pc), ane_type, los])
+        code_text.append([node_indices, text_indices, ane_type, los])
     return code_text
 
 
